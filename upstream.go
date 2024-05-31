@@ -102,10 +102,11 @@ type Upstream interface {
 }
 
 type UpstreamOptions struct {
-	Context context.Context
-	Logger  logger.ContextLogger
-	Dialer  N.Dialer
-	Address string
+	Context  context.Context
+	Logger   logger.ContextLogger
+	Dialer   N.Dialer
+	Address  string
+	Insecure bool
 }
 
 func baseTransportConstructor(options TransportOptions) (Transport, error) {

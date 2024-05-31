@@ -29,6 +29,7 @@ type TLSUpstream struct {
 	serverAddr  M.Socksaddr
 	access      sync.Mutex
 	connections list.List[*tlsDNSConn]
+	insecure    bool
 }
 
 type tlsDNSConn struct {
@@ -55,6 +56,7 @@ func newTLSUpstream(options UpstreamOptions, serverAddr M.Socksaddr) *TLSUpstrea
 	return &TLSUpstream{
 		dialer:     options.Dialer,
 		serverAddr: serverAddr,
+		insecure:   options.Insecure,
 	}
 }
 
@@ -95,7 +97,8 @@ func (t *TLSUpstream) Exchange(ctx context.Context, message *dns.Msg) (*dns.Msg,
 		return nil, err
 	}
 	tlsConn := tls.Client(tcpConn, &tls.Config{
-		ServerName: t.serverAddr.AddrString(),
+		ServerName:         t.serverAddr.AddrString(),
+		InsecureSkipVerify: t.insecure,
 	})
 	err = tlsConn.HandshakeContext(ctx)
 	if err != nil {
