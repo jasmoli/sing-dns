@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing/common"
@@ -14,7 +15,6 @@ import (
 	F "github.com/sagernet/sing/common/format"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
-	"github.com/sagernet/sing/common/task"
 
 	"github.com/miekg/dns"
 )
@@ -359,21 +359,33 @@ func (c *Client) exchangeFunc(ctx context.Context, transport Transport, message 
 		}
 	}
 	var timeToLive int
+	var wg1 sync.WaitGroup
 	for _, recordList := range [][]dns.RR{response.Answer, response.Ns, response.Extra} {
-		for _, record := range recordList {
-			if timeToLive == 0 || record.Header().Ttl > 0 && int(record.Header().Ttl) < timeToLive {
-				timeToLive = int(record.Header().Ttl)
+		wg1.Add(1)
+		go func(recordList []dns.RR) {
+			defer wg1.Done()
+			for _, record := range recordList {
+				if timeToLive == 0 || record.Header().Ttl > 0 && int(record.Header().Ttl) < timeToLive {
+					timeToLive = int(record.Header().Ttl)
+				}
 			}
-		}
+		}(recordList)
 	}
+	wg1.Wait()
 	if rewriteTTL, loaded := RewriteTTLFromContext(ctx); loaded {
 		timeToLive = int(rewriteTTL)
 	}
+	var wg2 sync.WaitGroup
 	for _, recordList := range [][]dns.RR{response.Answer, response.Ns, response.Extra} {
-		for _, record := range recordList {
-			record.Header().Ttl = uint32(timeToLive)
-		}
+		wg2.Add(1)
+		go func(recordList []dns.RR) {
+			defer wg2.Done()
+			for _, record := range recordList {
+				record.Header().Ttl = uint32(timeToLive)
+			}
+		}(recordList)
 	}
+	wg2.Wait()
 	response.Id = messageId
 	if !disableCache {
 		c.storeCache(transport, question, response, timeToLive)
@@ -648,26 +660,30 @@ func (c *Client) LookupWithResponseCheck(ctx context.Context, transport Transpor
 		}
 		var response4 []netip.Addr
 		var response6 []netip.Addr
-		var group task.Group
-		group.Append("exchange4", func(ctx context.Context) error {
+		var wg sync.WaitGroup
+		var errors []error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
 			response, err := c.lookupToExchange(ctx, transport, dnsName, dns.TypeA, strategy, isCacheUpdate, responseChecker)
 			if err != nil {
-				return err
+				errors = append(errors, err)
+				return
 			}
 			response4 = response
-			return nil
-		})
-		group.Append("exchange6", func(ctx context.Context) error {
+		}()
+		go func() {
+			defer wg.Done()
 			response, err := c.lookupToExchange(ctx, transport, dnsName, dns.TypeAAAA, strategy, isCacheUpdate, responseChecker)
 			if err != nil {
-				return err
+				errors = append(errors, err)
+				return
 			}
 			response6 = response
-			return nil
-		})
-		err := group.Run(ctx)
+		}()
+		wg.Wait()
 		if len(response4) == 0 && len(response6) == 0 {
-			return nil, err
+			return nil, E.Errors(errors...)
 		}
 		return sortAddresses(response4, response6, strategy), nil
 	}
@@ -974,11 +990,17 @@ func (c *Client) loadResponse(question dns.Question, transport Transport) (*dns.
 	if timeNow.After(expireAt) {
 		if c.lazyCache {
 			finalRes := response.Copy()
+			var wg sync.WaitGroup
 			for _, recordList := range [][]dns.RR{finalRes.Answer, finalRes.Ns, finalRes.Extra} {
-				for _, record := range recordList {
-					record.Header().Ttl = 1
-				}
+				wg.Add(1)
+				go func(recordList []dns.RR) {
+					for _, record := range recordList {
+						record.Header().Ttl = 1
+					}
+					wg.Done()
+				}(recordList)
 			}
+			wg.Wait()
 			return finalRes, 0, !isUpdating
 		}
 		if !c.independentCache {
@@ -1004,20 +1026,30 @@ func (c *Client) loadResponse(question dns.Question, transport Transport) (*dns.
 		nowTTL = 0
 	}
 	response = response.Copy()
+	var wg sync.WaitGroup
 	if originTTL > 0 {
 		duration := uint32(originTTL - nowTTL)
 		for _, recordList := range [][]dns.RR{response.Answer, response.Ns, response.Extra} {
-			for _, record := range recordList {
-				record.Header().Ttl = record.Header().Ttl - duration
-			}
+			wg.Add(1)
+			go func(recordList []dns.RR) {
+				for _, record := range recordList {
+					record.Header().Ttl = record.Header().Ttl - duration
+				}
+				wg.Done()
+			}(recordList)
 		}
 	} else {
 		for _, recordList := range [][]dns.RR{response.Answer, response.Ns, response.Extra} {
-			for _, record := range recordList {
-				record.Header().Ttl = uint32(nowTTL)
-			}
+			wg.Add(1)
+			go func(recordList []dns.RR) {
+				for _, record := range recordList {
+					record.Header().Ttl = uint32(nowTTL)
+				}
+				wg.Done()
+			}(recordList)
 		}
 	}
+	wg.Wait()
 	return response, nowTTL, !isUpdating && expireAt.Sub(timeNow) < 2*time.Second
 }
 
