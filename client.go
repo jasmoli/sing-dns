@@ -647,47 +647,163 @@ func (c *Client) Lookup(ctx context.Context, transport Transport, domain string,
 	return c.LookupWithResponseCheck(ctx, transport, domain, strategy, isCacheUpdate, nil)
 }
 
+type ResponseWithErr struct {
+	addresses []netip.Addr
+	err       error
+}
+
 func (c *Client) LookupWithResponseCheck(ctx context.Context, transport Transport, domain string, strategy DomainStrategy, isCacheUpdate bool, responseChecker func(responseAddrs []netip.Addr) bool) ([]netip.Addr, error) {
 	if dns.IsFqdn(domain) {
 		domain = domain[:len(domain)-1]
 	}
 	dnsName := dns.Fqdn(domain)
+	disableCache := c.disableCache || DisableCacheFromContext(ctx)
 	if transport.Raw() {
 		if strategy == DomainStrategyUseIPv4 {
 			return c.lookupToExchange(ctx, transport, dnsName, dns.TypeA, strategy, isCacheUpdate, responseChecker)
 		} else if strategy == DomainStrategyUseIPv6 {
 			return c.lookupToExchange(ctx, transport, dnsName, dns.TypeAAAA, strategy, isCacheUpdate, responseChecker)
 		}
-		var response4 []netip.Addr
-		var response6 []netip.Addr
-		var wg sync.WaitGroup
-		var errors []error
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			response, err := c.lookupToExchange(ctx, transport, dnsName, dns.TypeA, strategy, isCacheUpdate, responseChecker)
-			if err != nil {
-				errors = append(errors, err)
-				return
+		question4 := dns.Question{dnsName, dns.TypeA, dns.ClassINET}
+		question6 := dns.Question{dnsName, dns.TypeAAAA, dns.ClassINET}
+		if isCacheUpdate {
+			var wg sync.WaitGroup
+			var addresses []netip.Addr
+			var errors []error
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				addrs, err := c.lookupToExchangeFunc(ctx, transport, &question4, strategy, true, responseChecker)
+				if err == nil {
+					addresses = append(addresses, addrs...)
+				} else {
+					errors = append(errors, err)
+				}
+			}()
+			go func() {
+				defer wg.Done()
+				addrs, err := c.lookupToExchangeFunc(ctx, transport, &question6, strategy, true, responseChecker)
+				if err == nil {
+					addresses = append(addresses, addrs...)
+				} else {
+					errors = append(errors, err)
+				}
+			}()
+			wg.Wait()
+			if len(errors) < 2 {
+				return addresses, nil
 			}
-			response4 = response
-		}()
-		go func() {
-			defer wg.Done()
-			response, err := c.lookupToExchange(ctx, transport, dnsName, dns.TypeAAAA, strategy, isCacheUpdate, responseChecker)
-			if err != nil {
-				errors = append(errors, err)
-				return
-			}
-			response6 = response
-		}()
-		wg.Wait()
-		if len(response4) == 0 && len(response6) == 0 {
 			return nil, E.Errors(errors...)
 		}
-		return sortAddresses(response4, response6, strategy), nil
+		if !disableCache {
+			var wg sync.WaitGroup
+			var cache4, cache6 []netip.Addr
+			var needUpdate4, needUpdate6 bool
+			var err4, err6 error
+			wg.Add(2)
+			go func() {
+				cache4, needUpdate4, err4 = c.questionCache(question4, transport)
+				wg.Done()
+			}()
+			go func() {
+				cache6, needUpdate6, err6 = c.questionCache(question6, transport)
+				wg.Done()
+			}()
+			wg.Wait()
+			if !errors.Is(err4, ErrNotCached) || !errors.Is(err6, ErrNotCached) {
+				if needUpdate4 || errors.Is(err4, ErrNotCached) {
+					go c.lookupToExchangeFunc(copyContext(ctx), transport, &question4, strategy, true, responseChecker)
+				}
+				if needUpdate6 || errors.Is(err6, ErrNotCached) {
+					go c.lookupToExchangeFunc(copyContext(ctx), transport, &question6, strategy, true, responseChecker)
+				}
+				var addresses []netip.Addr
+				var errs []error
+				if err4 == nil {
+					addresses = append(addresses, cache4...)
+				} else if !errors.Is(err4, ErrNotCached) {
+					errs = append(errs, err4)
+				}
+				if err6 == nil {
+					addresses = append(addresses, cache6...)
+				} else if !errors.Is(err6, ErrNotCached) {
+					errs = append(errs, err6)
+				}
+				if err4 == nil || err6 == nil {
+					return addresses, nil
+				}
+				return nil, E.Errors(errs...)
+			}
+		}
+		var wg sync.WaitGroup
+		responseChan4 := make(chan ResponseWithErr, 1)
+		responseChan6 := make(chan ResponseWithErr, 1)
+		wg.Add(2)
+		defer func() {
+			go func() {
+				wg.Wait()
+				close(responseChan4)
+				close(responseChan6)
+			}()
+		}()
+		go func() {
+			defer wg.Done()
+			addresses, err := c.lookupToExchangeFunc(copyContext(ctx), transport, &question4, strategy, false, responseChecker)
+			responseChan4 <- ResponseWithErr{addresses, err}
+		}()
+		go func() {
+			defer wg.Done()
+			addresses, err := c.lookupToExchangeFunc(copyContext(ctx), transport, &question6, strategy, false, responseChecker)
+			responseChan6 <- ResponseWithErr{addresses, err}
+		}()
+		var errors []error
+		switch strategy {
+		case DomainStrategyAsIS:
+			for i := 0; i < 2; i++ {
+				select {
+				case result := <-responseChan4:
+					if result.err != nil {
+						errors = append(errors, result.err)
+					} else if len(result.addresses) > 0 {
+						return result.addresses, nil
+					}
+				case result := <-responseChan6:
+					if result.err != nil {
+						errors = append(errors, result.err)
+					} else if len(result.addresses) > 0 {
+						return result.addresses, nil
+					}
+				}
+			}
+		case DomainStrategyPreferIPv4:
+			result := <-responseChan4
+			if result.err != nil {
+				errors = append(errors, result.err)
+			} else if len(result.addresses) > 0 {
+				return result.addresses, nil
+			}
+			result = <-responseChan6
+			if result.err != nil {
+				errors = append(errors, result.err)
+			} else if len(result.addresses) > 0 {
+				return result.addresses, nil
+			}
+		case DomainStrategyPreferIPv6:
+			result := <-responseChan6
+			if result.err != nil {
+				errors = append(errors, result.err)
+			} else if len(result.addresses) > 0 {
+				return result.addresses, nil
+			}
+			result = <-responseChan4
+			if result.err != nil {
+				errors = append(errors, result.err)
+			} else if len(result.addresses) > 0 {
+				return result.addresses, nil
+			}
+		}
+		return nil, E.Errors(errors...)
 	}
-	disableCache := c.disableCache || DisableCacheFromContext(ctx)
 	if !isCacheUpdate && !disableCache {
 		if strategy == DomainStrategyUseIPv4 {
 			response, needUpdate, err := c.questionCache(dns.Question{
