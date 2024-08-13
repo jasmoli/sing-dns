@@ -17,21 +17,20 @@ import (
 	"github.com/miekg/dns"
 )
 
-var _ Transport = (*TCPTransport)(nil)
+var _ Upstream = (*TCPUpstream)(nil)
 
 func init() {
-	RegisterTransport([]string{"tcp"}, func(options TransportOptions) (Transport, error) {
-		return NewTCPTransport(options)
+	RegisterUpstream([]string{"tcp"}, func(options UpstreamOptions) (Upstream, error) {
+		return NewTCPUpstream(options)
 	})
 }
 
-type TCPTransport struct {
-	name       string
+type TCPUpstream struct {
 	dialer     N.Dialer
 	serverAddr M.Socksaddr
 }
 
-func NewTCPTransport(options TransportOptions) (*TCPTransport, error) {
+func NewTCPUpstream(options UpstreamOptions) (*TCPUpstream, error) {
 	serverURL, err := url.Parse(options.Address)
 	if err != nil {
 		return nil, err
@@ -43,37 +42,32 @@ func NewTCPTransport(options TransportOptions) (*TCPTransport, error) {
 	if serverAddr.Port == 0 {
 		serverAddr.Port = 53
 	}
-	return newTCPTransport(options, serverAddr), nil
+	return newTCPUpstream(options, serverAddr), nil
 }
 
-func newTCPTransport(options TransportOptions, serverAddr M.Socksaddr) *TCPTransport {
-	return &TCPTransport{
-		name:       options.Name,
+func newTCPUpstream(options UpstreamOptions, serverAddr M.Socksaddr) *TCPUpstream {
+	return &TCPUpstream{
 		dialer:     options.Dialer,
 		serverAddr: serverAddr,
 	}
 }
 
-func (t *TCPTransport) Name() string {
-	return t.name
-}
-
-func (t *TCPTransport) Start() error {
+func (t *TCPUpstream) Start() error {
 	return nil
 }
 
-func (t *TCPTransport) Reset() {
+func (t *TCPUpstream) Reset() {
 }
 
-func (t *TCPTransport) Close() error {
+func (t *TCPUpstream) Close() error {
 	return nil
 }
 
-func (t *TCPTransport) Raw() bool {
+func (t *TCPUpstream) Raw() bool {
 	return true
 }
 
-func (t *TCPTransport) Exchange(ctx context.Context, message *dns.Msg) (*dns.Msg, error) {
+func (t *TCPUpstream) Exchange(ctx context.Context, message *dns.Msg) (*dns.Msg, error) {
 	conn, err := t.dialer.DialContext(ctx, N.NetworkTCP, t.serverAddr)
 	if err != nil {
 		return nil, err
@@ -86,7 +80,7 @@ func (t *TCPTransport) Exchange(ctx context.Context, message *dns.Msg) (*dns.Msg
 	return readMessage(conn)
 }
 
-func (t *TCPTransport) Lookup(ctx context.Context, domain string, strategy DomainStrategy) ([]netip.Addr, error) {
+func (t *TCPUpstream) Lookup(ctx context.Context, domain string, strategy DomainStrategy) ([]netip.Addr, error) {
 	return nil, os.ErrInvalid
 }
 
