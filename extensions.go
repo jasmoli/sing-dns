@@ -54,3 +54,18 @@ func ClientSubnetFromContext(ctx context.Context) (netip.Prefix, bool) {
 	clientSubnet, ok := ctx.Value(clientSubnetKey{}).(netip.Prefix)
 	return clientSubnet, ok
 }
+
+func copyContext(ctx context.Context) context.Context {
+	result := context.Background()
+	result = ContextWithDisableCache(result, DisableCacheFromContext(ctx))
+	if rewriteTTL, hasRewriteTTl := RewriteTTLFromContext(ctx); hasRewriteTTl {
+		result = ContextWithRewriteTTL(result, rewriteTTL)
+	}
+	if transportName, hasTransportName := transportNameFromContext(ctx); hasTransportName {
+		result = contextWithTransportName(result, transportName)
+	}
+	if clientSubnet, hasClientSubnet := ClientSubnetFromContext(ctx); hasClientSubnet {
+		result = ContextWithClientSubnet(result, clientSubnet)
+	}
+	return result
+}

@@ -62,7 +62,7 @@ func (d *DialerWrapper) DialContext(ctx context.Context, network string, destina
 	if addresses := d.client.GetAddrsFromHosts(ctx, destination.Fqdn, d.strategy, false); len(addresses) > 0 {
 		return N.DialParallel(ctx, d.dialer, network, destination, addresses, d.strategy == DomainStrategyPreferIPv6, d.fallbackDelay)
 	}
-	addresses, err := d.client.Lookup(ctx, d.transport, destination.Fqdn, d.strategy)
+	addresses, err := d.client.Lookup(ctx, d.transport, destination.Fqdn, d.strategy, false)
 	if err != nil {
 		return nil, err
 	}
@@ -78,7 +78,7 @@ func (d *DialerWrapper) ListenPacket(ctx context.Context, destination M.Socksadd
 		conn, _, err := N.ListenSerial(ctx, d.dialer, destination, addresses)
 		return conn, err
 	}
-	addresses, err := d.client.Lookup(ctx, d.transport, destination.Fqdn, d.strategy)
+	addresses, err := d.client.Lookup(ctx, d.transport, destination.Fqdn, d.strategy, false)
 	if err != nil {
 		return nil, err
 	}

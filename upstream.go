@@ -58,14 +58,12 @@ type exchangeResult struct {
 }
 
 func (t *BaseTransport) Exchange(ctx context.Context, message *dns.Msg) (*dns.Msg, error) {
-	fastClose, cancel := context.WithCancel(ctx)
-	defer cancel()
 	var wg sync.WaitGroup
 	results := make(chan exchangeResult, len(t.upstreams))
 	for _, upstream := range t.upstreams {
 		wg.Add(1)
 		go func(upstream Upstream) {
-			msg, err := upstream.Exchange(fastClose, message)
+			msg, err := upstream.Exchange(ctx, message)
 			results <- exchangeResult{msg, err}
 			wg.Done()
 		}(upstream)

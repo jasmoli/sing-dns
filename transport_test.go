@@ -37,7 +37,7 @@ func TestTransports(t *testing.T) {
 			client := dns.NewClient(dns.ClientOptions{
 				Logger: logger.NOP(),
 			})
-			addresses, err := client.Lookup(context.Background(), transport, "cloudflare.com", dns.DomainStrategyAsIS)
+			addresses, err := client.Lookup(context.Background(), transport, "cloudflare.com", dns.DomainStrategyAsIS, false)
 			require.NoError(t, err)
 			require.NotEmpty(t, addresses)
 		})
