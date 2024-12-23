@@ -2,16 +2,17 @@ package dns
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
-	"github.com/sagernet/sing/common/task"
 	"github.com/sagernet/sing/contrab/freelru"
 	"github.com/sagernet/sing/contrab/maphash"
 
@@ -462,28 +463,21 @@ func (c *Client) LookupWithResponseCheck(ctx context.Context, transport Transpor
 		} else if options.Strategy == DomainStrategyUseIPv6 {
 			return c.lookupToExchange(ctx, transport, dnsName, dns.TypeAAAA, options, responseChecker)
 		}
-		var response4 []netip.Addr
-		var response6 []netip.Addr
-		var group task.Group
-		group.Append("exchange4", func(ctx context.Context) error {
-			response, err := c.lookupToExchange(ctx, transport, dnsName, dns.TypeA, options, responseChecker)
-			if err != nil {
-				return err
-			}
-			response4 = response
-			return nil
-		})
-		group.Append("exchange6", func(ctx context.Context) error {
-			response, err := c.lookupToExchange(ctx, transport, dnsName, dns.TypeAAAA, options, responseChecker)
-			if err != nil {
-				return err
-			}
-			response6 = response
-			return nil
-		})
-		err := group.Run(ctx)
+		var wg sync.WaitGroup
+		var response4, response6 []netip.Addr
+		var v4Err, v6Err error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			response4, v4Err = c.lookupToExchange(ctx, transport, dnsName, dns.TypeA, options, responseChecker)
+		}()
+		go func() {
+			defer wg.Done()
+			response6, v6Err = c.lookupToExchange(ctx, transport, dnsName, dns.TypeAAAA, options, responseChecker)
+		}()
+		wg.Wait()
 		if len(response4) == 0 && len(response6) == 0 {
-			return nil, err
+			return nil, errors.Join(v4Err, v6Err)
 		}
 		return sortAddresses(response4, response6, options.Strategy), nil
 	}
@@ -508,16 +502,26 @@ func (c *Client) LookupWithResponseCheck(ctx context.Context, transport Transpor
 				return response, err
 			}
 		} else {
-			response4, _ := c.questionCache(dns.Question{
-				Name:   dnsName,
-				Qtype:  dns.TypeA,
-				Qclass: dns.ClassINET,
-			}, transport)
-			response6, _ := c.questionCache(dns.Question{
-				Name:   dnsName,
-				Qtype:  dns.TypeAAAA,
-				Qclass: dns.ClassINET,
-			}, transport)
+			var wg sync.WaitGroup
+			var response4, response6 []netip.Addr
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				response4, _ = c.questionCache(dns.Question{
+					Name:   dnsName,
+					Qtype:  dns.TypeA,
+					Qclass: dns.ClassINET,
+				}, transport)
+			}()
+			go func() {
+				defer wg.Done()
+				response6, _ = c.questionCache(dns.Question{
+					Name:   dnsName,
+					Qtype:  dns.TypeAAAA,
+					Qclass: dns.ClassINET,
+				}, transport)
+			}()
+			wg.Wait()
 			if len(response4) > 0 || len(response6) > 0 {
 				return sortAddresses(response4, response6, options.Strategy), nil
 			}
@@ -568,62 +572,74 @@ func (c *Client) LookupWithResponseCheck(ctx context.Context, transport Transpor
 		} else {
 			timeToLive = DefaultTTL
 		}
+		var wg sync.WaitGroup
+		wg.Add(1)
 		if options.Strategy != DomainStrategyUseIPv6 {
-			question4 := dns.Question{
-				Name:   dnsName,
-				Qtype:  dns.TypeA,
-				Qclass: dns.ClassINET,
-			}
-			response4 := common.Filter(response, func(addr netip.Addr) bool {
-				return addr.Is4() || addr.Is4In6()
-			})
-			message4 := &dns.Msg{
-				MsgHdr:   header,
-				Question: []dns.Question{question4},
-			}
-			if len(response4) > 0 {
-				for _, address := range response4 {
-					message4.Answer = append(message4.Answer, &dns.A{
-						Hdr: dns.RR_Header{
-							Name:   question4.Name,
-							Rrtype: dns.TypeA,
-							Class:  dns.ClassINET,
-							Ttl:    timeToLive,
-						},
-						A: address.AsSlice(),
-					})
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				question4 := dns.Question{
+					Name:   dnsName,
+					Qtype:  dns.TypeA,
+					Qclass: dns.ClassINET,
 				}
-			}
-			c.storeCache(transport, question4, message4, int(timeToLive))
+				response4 := common.Filter(response, func(addr netip.Addr) bool {
+					return addr.Is4() || addr.Is4In6()
+				})
+				message4 := &dns.Msg{
+					MsgHdr:   header,
+					Question: []dns.Question{question4},
+				}
+				if len(response4) > 0 {
+					for _, address := range response4 {
+						message4.Answer = append(message4.Answer, &dns.A{
+							Hdr: dns.RR_Header{
+								Name:   question4.Name,
+								Rrtype: dns.TypeA,
+								Class:  dns.ClassINET,
+								Ttl:    timeToLive,
+							},
+							A: address.AsSlice(),
+						})
+					}
+				}
+				c.storeCache(transport, question4, message4, int(timeToLive))
+			}()
 		}
 		if options.Strategy != DomainStrategyUseIPv4 {
-			question6 := dns.Question{
-				Name:   dnsName,
-				Qtype:  dns.TypeAAAA,
-				Qclass: dns.ClassINET,
-			}
-			response6 := common.Filter(response, func(addr netip.Addr) bool {
-				return addr.Is6() && !addr.Is4In6()
-			})
-			message6 := &dns.Msg{
-				MsgHdr:   header,
-				Question: []dns.Question{question6},
-			}
-			if len(response6) > 0 {
-				for _, address := range response6 {
-					message6.Answer = append(message6.Answer, &dns.AAAA{
-						Hdr: dns.RR_Header{
-							Name:   question6.Name,
-							Rrtype: dns.TypeAAAA,
-							Class:  dns.ClassINET,
-							Ttl:    DefaultTTL,
-						},
-						AAAA: address.AsSlice(),
-					})
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				question6 := dns.Question{
+					Name:   dnsName,
+					Qtype:  dns.TypeAAAA,
+					Qclass: dns.ClassINET,
 				}
-			}
-			c.storeCache(transport, question6, message6, int(timeToLive))
+				response6 := common.Filter(response, func(addr netip.Addr) bool {
+					return addr.Is6() && !addr.Is4In6()
+				})
+				message6 := &dns.Msg{
+					MsgHdr:   header,
+					Question: []dns.Question{question6},
+				}
+				if len(response6) > 0 {
+					for _, address := range response6 {
+						message6.Answer = append(message6.Answer, &dns.AAAA{
+							Hdr: dns.RR_Header{
+								Name:   question6.Name,
+								Rrtype: dns.TypeAAAA,
+								Class:  dns.ClassINET,
+								Ttl:    DefaultTTL,
+							},
+							AAAA: address.AsSlice(),
+						})
+					}
+				}
+				c.storeCache(transport, question6, message6, int(timeToLive))
+			}()
 		}
+		wg.Done()
+		wg.Wait()
 	}
 	return response, nil
 }
@@ -664,16 +680,26 @@ func (c *Client) LookupCache(ctx context.Context, domain string, strategy Domain
 			return response, true
 		}
 	} else {
-		response4, _ := c.questionCache(dns.Question{
-			Name:   dnsName,
-			Qtype:  dns.TypeA,
-			Qclass: dns.ClassINET,
-		}, nil)
-		response6, _ := c.questionCache(dns.Question{
-			Name:   dnsName,
-			Qtype:  dns.TypeAAAA,
-			Qclass: dns.ClassINET,
-		}, nil)
+		var wg sync.WaitGroup
+		var response4, response6 []netip.Addr
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			response4, _ = c.questionCache(dns.Question{
+				Name:   dnsName,
+				Qtype:  dns.TypeA,
+				Qclass: dns.ClassINET,
+			}, nil)
+		}()
+		go func() {
+			defer wg.Done()
+			response6, _ = c.questionCache(dns.Question{
+				Name:   dnsName,
+				Qtype:  dns.TypeAAAA,
+				Qclass: dns.ClassINET,
+			}, nil)
+		}()
+		wg.Wait()
 		if len(response4) > 0 || len(response6) > 0 {
 			return sortAddresses(response4, response6, strategy), true
 		}
