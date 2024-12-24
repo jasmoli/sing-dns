@@ -8,3 +8,12 @@ type QueryOptions struct {
 	RewriteTTL   *uint32
 	ClientSubnet netip.Prefix
 }
+
+func (o *QueryOptions) Copy() QueryOptions {
+	return QueryOptions{
+		Strategy:     o.Strategy,
+		DisableCache: o.DisableCache,
+		RewriteTTL:   o.RewriteTTL,
+		ClientSubnet: o.ClientSubnet,
+	}
+}

@@ -64,7 +64,7 @@ func (d *DialerWrapper) DialContext(ctx context.Context, network string, destina
 	}
 	addresses, err := d.client.Lookup(ctx, d.transport, destination.Fqdn, QueryOptions{
 		Strategy: d.strategy,
-	})
+	}, false)
 	if err != nil {
 		return nil, err
 	}
@@ -82,7 +82,7 @@ func (d *DialerWrapper) ListenPacket(ctx context.Context, destination M.Socksadd
 	}
 	addresses, err := d.client.Lookup(ctx, d.transport, destination.Fqdn, QueryOptions{
 		Strategy: d.strategy,
-	})
+	}, false)
 	if err != nil {
 		return nil, err
 	}

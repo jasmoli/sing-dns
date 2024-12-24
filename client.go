@@ -11,6 +11,7 @@ import (
 
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
+	F "github.com/sagernet/sing/common/format"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/contrab/freelru"
@@ -79,16 +80,19 @@ func NewHosts(hostsMap map[string][]string) (*Hosts, error) {
 }
 
 type Client struct {
-	timeout          time.Duration
-	disableCache     bool
-	disableExpire    bool
-	independentCache bool
-	hosts            *Hosts
-	rdrc             RDRCStore
-	initRDRCFunc     func() RDRCStore
-	logger           logger.ContextLogger
-	cache            freelru.Cache[dns.Question, *dns.Msg]
-	transportCache   freelru.Cache[transportCacheKey, *dns.Msg]
+	timeout                time.Duration
+	disableCache           bool
+	disableExpire          bool
+	independentCache       bool
+	lazyCache              bool
+	hosts                  *Hosts
+	rdrc                   RDRCStore
+	initRDRCFunc           func() RDRCStore
+	logger                 logger.ContextLogger
+	cache                  freelru.Cache[dns.Question, *dns.Msg]
+	cacheUpdating          freelru.Cache[dns.Question, struct{}]
+	transportCache         freelru.Cache[transportCacheKey, *dns.Msg]
+	transportCacheUpdating freelru.Cache[transportCacheKey, struct{}]
 }
 
 type RDRCStore interface {
@@ -108,6 +112,7 @@ type ClientOptions struct {
 	DisableExpire    bool
 	IndependentCache bool
 	CacheCapacity    uint32
+	LazyCache        bool
 	Hosts            *Hosts
 	RDRC             func() RDRCStore
 	Logger           logger.ContextLogger
@@ -119,6 +124,7 @@ func NewClient(options ClientOptions) *Client {
 		disableCache:     options.DisableCache,
 		disableExpire:    options.DisableExpire,
 		independentCache: options.IndependentCache,
+		lazyCache:        options.LazyCache,
 		hosts:            options.Hosts,
 		initRDRCFunc:     options.RDRC,
 		logger:           options.Logger,
@@ -287,11 +293,11 @@ func (c *Client) SearchIPHosts(ctx context.Context, message *dns.Msg, strategy D
 	return &response
 }
 
-func (c *Client) Exchange(ctx context.Context, transport Transport, message *dns.Msg, options QueryOptions) (*dns.Msg, error) {
-	return c.ExchangeWithResponseCheck(ctx, transport, message, options, nil)
+func (c *Client) Exchange(ctx context.Context, transport Transport, message *dns.Msg, options QueryOptions, isCacheUpdate bool) (*dns.Msg, error) {
+	return c.ExchangeWithResponseCheck(ctx, transport, message, options, isCacheUpdate, nil)
 }
 
-func (c *Client) ExchangeWithResponseCheck(ctx context.Context, transport Transport, message *dns.Msg, options QueryOptions, responseChecker func(response *dns.Msg) bool) (*dns.Msg, error) {
+func (c *Client) ExchangeWithResponseCheck(ctx context.Context, transport Transport, message *dns.Msg, options QueryOptions, isCacheUpdate bool, responseChecker func(response *dns.Msg) bool) (*dns.Msg, error) {
 	if len(message.Question) == 0 {
 		if c.logger != nil {
 			c.logger.WarnContext(ctx, "bad question size: ", len(message.Question))
@@ -315,11 +321,14 @@ func (c *Client) ExchangeWithResponseCheck(ctx context.Context, transport Transp
 		len(message.Extra) == 0 &&
 		!options.ClientSubnet.IsValid()
 	disableCache := !isSimpleRequest || c.disableCache || options.DisableCache
-	if !disableCache {
-		response, ttl := c.loadResponse(question, transport)
+	if !isCacheUpdate && !disableCache {
+		response, ttl, needUpdate := c.loadResponse(question, transport)
 		if response != nil {
 			logCachedResponse(c.logger, ctx, response, ttl)
 			response.Id = message.Id
+			if needUpdate {
+				go c.updateExchangeCache(transport, message, options, disableCache, responseChecker)
+			}
 			return response, nil
 		}
 	}
@@ -337,9 +346,14 @@ func (c *Client) ExchangeWithResponseCheck(ctx context.Context, transport Transp
 		}
 		return &responseMessage, nil
 	}
+	return c.exchangeFunc(ctx, transport, message, options, disableCache, isCacheUpdate, responseChecker)
+}
+
+func (c *Client) exchangeFunc(ctx context.Context, transport Transport, message *dns.Msg, options QueryOptions, disableCache bool, isCacheUpdate bool, responseChecker func(response *dns.Msg) bool) (*dns.Msg, error) {
+	question := message.Question[0]
 	if !transport.Raw() {
 		if question.Qtype == dns.TypeA || question.Qtype == dns.TypeAAAA {
-			return c.exchangeToLookup(ctx, transport, message, question, options)
+			return c.exchangeToLookup(ctx, transport, message, question, options, isCacheUpdate)
 		}
 		return nil, ErrNoRawSupport
 	}
@@ -354,6 +368,13 @@ func (c *Client) ExchangeWithResponseCheck(ctx context.Context, transport Transp
 		if rejected {
 			return nil, ErrResponseRejectedCached
 		}
+	}
+	if isCacheUpdate {
+		if c.getUpdatingStatus(question, transport) {
+			return nil, E.New("cache is updating")
+		}
+		c.storeUpdatingStatus(question, transport)
+		defer c.removeUpdatingStatus(question, transport)
 	}
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	response, err := transport.Exchange(ctx, message)
@@ -410,6 +431,26 @@ func (c *Client) ExchangeWithResponseCheck(ctx context.Context, transport Transp
 	return response, err
 }
 
+func (c *Client) updateExchangeCache(transport Transport, message *dns.Msg, options QueryOptions, disableCache bool, responseChecker func(response *dns.Msg) bool) {
+	ctx := context.Background()
+	if len(message.Question) > 0 {
+		c.logger.DebugContext(ctx, "update ", formatQuestion(message.Question[0].String()), " exchange cache")
+	}
+	_, err := c.exchangeFunc(ctx, transport, message, options, disableCache, true, responseChecker)
+	if err == nil {
+		return
+	}
+	if errors.Is(err, ErrResponseRejectedCached) {
+		c.logger.DebugContext(ctx, E.Cause(err, "response rejected for ", formatQuestion(message.Question[0].String())), " (cached)")
+	} else if errors.Is(err, ErrResponseRejected) {
+		c.logger.DebugContext(ctx, E.Cause(err, "response rejected for ", formatQuestion(message.Question[0].String())))
+	} else if len(message.Question) > 0 {
+		c.logger.ErrorContext(ctx, E.Cause(err, "exchange failed for ", formatQuestion(message.Question[0].String())))
+	} else {
+		c.logger.ErrorContext(ctx, E.Cause(err, "exchange failed for <empty query>"))
+	}
+}
+
 func (c *Client) GetExactDomainFromHosts(ctx context.Context, domain string, nolog bool) string {
 	if c.hosts == nil || domain == "" {
 		return domain
@@ -448,20 +489,20 @@ func (c *Client) GetAddrsFromHosts(ctx context.Context, domain string, stategy D
 	return addrs
 }
 
-func (c *Client) Lookup(ctx context.Context, transport Transport, domain string, options QueryOptions) ([]netip.Addr, error) {
-	return c.LookupWithResponseCheck(ctx, transport, domain, options, nil)
+func (c *Client) Lookup(ctx context.Context, transport Transport, domain string, options QueryOptions, isCacheUpdate bool) ([]netip.Addr, error) {
+	return c.LookupWithResponseCheck(ctx, transport, domain, options, isCacheUpdate, nil)
 }
 
-func (c *Client) LookupWithResponseCheck(ctx context.Context, transport Transport, domain string, options QueryOptions, responseChecker func(responseAddrs []netip.Addr) bool) ([]netip.Addr, error) {
+func (c *Client) LookupWithResponseCheck(ctx context.Context, transport Transport, domain string, options QueryOptions, isCacheUpdate bool, responseChecker func(responseAddrs []netip.Addr) bool) ([]netip.Addr, error) {
 	if dns.IsFqdn(domain) {
 		domain = domain[:len(domain)-1]
 	}
 	dnsName := dns.Fqdn(domain)
 	if transport.Raw() {
 		if options.Strategy == DomainStrategyUseIPv4 {
-			return c.lookupToExchange(ctx, transport, dnsName, dns.TypeA, options, responseChecker)
+			return c.lookupToExchange(ctx, transport, dnsName, dns.TypeA, options, isCacheUpdate, responseChecker)
 		} else if options.Strategy == DomainStrategyUseIPv6 {
-			return c.lookupToExchange(ctx, transport, dnsName, dns.TypeAAAA, options, responseChecker)
+			return c.lookupToExchange(ctx, transport, dnsName, dns.TypeAAAA, options, isCacheUpdate, responseChecker)
 		}
 		var wg sync.WaitGroup
 		var response4, response6 []netip.Addr
@@ -469,11 +510,11 @@ func (c *Client) LookupWithResponseCheck(ctx context.Context, transport Transpor
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			response4, v4Err = c.lookupToExchange(ctx, transport, dnsName, dns.TypeA, options, responseChecker)
+			response4, v4Err = c.lookupToExchange(ctx, transport, dnsName, dns.TypeA, options, isCacheUpdate, responseChecker)
 		}()
 		go func() {
 			defer wg.Done()
-			response6, v6Err = c.lookupToExchange(ctx, transport, dnsName, dns.TypeAAAA, options, responseChecker)
+			response6, v6Err = c.lookupToExchange(ctx, transport, dnsName, dns.TypeAAAA, options, isCacheUpdate, responseChecker)
 		}()
 		wg.Wait()
 		if len(response4) == 0 && len(response6) == 0 {
@@ -482,32 +523,39 @@ func (c *Client) LookupWithResponseCheck(ctx context.Context, transport Transpor
 		return sortAddresses(response4, response6, options.Strategy), nil
 	}
 	disableCache := c.disableCache || options.DisableCache
-	if !disableCache {
+	if !isCacheUpdate && !disableCache {
 		if options.Strategy == DomainStrategyUseIPv4 {
-			response, err := c.questionCache(dns.Question{
+			response, needUpdate, err := c.questionCache(dns.Question{
 				Name:   dnsName,
 				Qtype:  dns.TypeA,
 				Qclass: dns.ClassINET,
 			}, transport)
 			if err != ErrNotCached {
+				if needUpdate {
+					go c.updateLookupCache(transport, domain, options, disableCache, responseChecker)
+				}
 				return response, err
 			}
 		} else if options.Strategy == DomainStrategyUseIPv6 {
-			response, err := c.questionCache(dns.Question{
+			response, needUpdate, err := c.questionCache(dns.Question{
 				Name:   dnsName,
 				Qtype:  dns.TypeAAAA,
 				Qclass: dns.ClassINET,
 			}, transport)
 			if err != ErrNotCached {
+				if needUpdate {
+					go c.updateLookupCache(transport, domain, options, disableCache, responseChecker)
+				}
 				return response, err
 			}
 		} else {
 			var wg sync.WaitGroup
 			var response4, response6 []netip.Addr
+			var needUpdate4, needUpdate6 bool
 			wg.Add(2)
 			go func() {
 				defer wg.Done()
-				response4, _ = c.questionCache(dns.Question{
+				response4, needUpdate4, _ = c.questionCache(dns.Question{
 					Name:   dnsName,
 					Qtype:  dns.TypeA,
 					Qclass: dns.ClassINET,
@@ -515,7 +563,7 @@ func (c *Client) LookupWithResponseCheck(ctx context.Context, transport Transpor
 			}()
 			go func() {
 				defer wg.Done()
-				response6, _ = c.questionCache(dns.Question{
+				response6, needUpdate6, _ = c.questionCache(dns.Question{
 					Name:   dnsName,
 					Qtype:  dns.TypeAAAA,
 					Qclass: dns.ClassINET,
@@ -523,6 +571,9 @@ func (c *Client) LookupWithResponseCheck(ctx context.Context, transport Transpor
 			}()
 			wg.Wait()
 			if len(response4) > 0 || len(response6) > 0 {
+				if needUpdate4 || needUpdate6 {
+					go c.updateLookupCache(transport, domain, options, disableCache, responseChecker)
+				}
 				return sortAddresses(response4, response6, options.Strategy), nil
 			}
 		}
@@ -539,8 +590,41 @@ func (c *Client) LookupWithResponseCheck(ctx context.Context, transport Transpor
 			return nil, ErrResponseRejectedCached
 		}
 	}
+	return c.lookupFunc(ctx, transport, domain, options, disableCache, isCacheUpdate, responseChecker)
+}
+
+func (c *Client) lookupFunc(ctx context.Context, transport Transport, domain string, options QueryOptions, disableCache, isCacheUpdate bool, responseChecker func(responseAddrs []netip.Addr) bool) ([]netip.Addr, error) {
+	if dns.IsFqdn(domain) {
+		domain = domain[:len(domain)-1]
+	}
+	dnsName := dns.Fqdn(domain)
+	if isCacheUpdate {
+		if options.Strategy != DomainStrategyUseIPv6 {
+			question4 := dns.Question{
+				Name:   dnsName,
+				Qtype:  dns.TypeA,
+				Qclass: dns.ClassINET,
+			}
+			if c.getUpdatingStatus(question4, transport) {
+				return nil, E.New("cache is updating")
+			}
+			c.storeUpdatingStatus(question4, transport)
+			defer c.removeUpdatingStatus(question4, transport)
+		}
+		if options.Strategy != DomainStrategyUseIPv4 {
+			question6 := dns.Question{
+				Name:   dnsName,
+				Qtype:  dns.TypeAAAA,
+				Qclass: dns.ClassINET,
+			}
+			if c.getUpdatingStatus(question6, transport) {
+				return nil, E.New("cache is updating")
+			}
+			c.storeUpdatingStatus(question6, transport)
+			defer c.removeUpdatingStatus(question6, transport)
+		}
+	}
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
-	var rCode int
 	response, err := transport.Lookup(ctx, domain, options.Strategy)
 	cancel()
 	if err != nil {
@@ -561,10 +645,6 @@ func (c *Client) LookupWithResponseCheck(ctx context.Context, transport Transpor
 		}
 		return response, ErrResponseRejected
 	}
-	header := dns.MsgHdr{
-		Response: true,
-		Rcode:    rCode,
-	}
 	if !disableCache {
 		var timeToLive uint32
 		if options.RewriteTTL != nil {
@@ -578,70 +658,76 @@ func (c *Client) LookupWithResponseCheck(ctx context.Context, transport Transpor
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				question4 := dns.Question{
-					Name:   dnsName,
-					Qtype:  dns.TypeA,
-					Qclass: dns.ClassINET,
-				}
 				response4 := common.Filter(response, func(addr netip.Addr) bool {
 					return addr.Is4() || addr.Is4In6()
 				})
-				message4 := &dns.Msg{
-					MsgHdr:   header,
-					Question: []dns.Question{question4},
-				}
-				if len(response4) > 0 {
-					for _, address := range response4 {
-						message4.Answer = append(message4.Answer, &dns.A{
-							Hdr: dns.RR_Header{
-								Name:   question4.Name,
-								Rrtype: dns.TypeA,
-								Class:  dns.ClassINET,
-								Ttl:    timeToLive,
-							},
-							A: address.AsSlice(),
-						})
-					}
-				}
-				c.storeCache(transport, question4, message4, int(timeToLive))
+				c.storeLookupCache(dnsName, dns.TypeA, response4, transport, timeToLive)
 			}()
 		}
 		if options.Strategy != DomainStrategyUseIPv4 {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				question6 := dns.Question{
-					Name:   dnsName,
-					Qtype:  dns.TypeAAAA,
-					Qclass: dns.ClassINET,
-				}
 				response6 := common.Filter(response, func(addr netip.Addr) bool {
 					return addr.Is6() && !addr.Is4In6()
 				})
-				message6 := &dns.Msg{
-					MsgHdr:   header,
-					Question: []dns.Question{question6},
-				}
-				if len(response6) > 0 {
-					for _, address := range response6 {
-						message6.Answer = append(message6.Answer, &dns.AAAA{
-							Hdr: dns.RR_Header{
-								Name:   question6.Name,
-								Rrtype: dns.TypeAAAA,
-								Class:  dns.ClassINET,
-								Ttl:    DefaultTTL,
-							},
-							AAAA: address.AsSlice(),
-						})
-					}
-				}
-				c.storeCache(transport, question6, message6, int(timeToLive))
+				c.storeLookupCache(dnsName, dns.TypeAAAA, response6, transport, timeToLive)
 			}()
 		}
 		wg.Done()
 		wg.Wait()
 	}
 	return response, nil
+}
+
+func (c *Client) storeLookupCache(dnsName string, qType uint16, response []netip.Addr, transport Transport, timeToLive uint32) {
+	question := dns.Question{
+		Name:   dnsName,
+		Qtype:  qType,
+		Qclass: dns.ClassINET,
+	}
+	message := &dns.Msg{
+		MsgHdr: dns.MsgHdr{
+			Response: true,
+			Rcode:    dns.RcodeSuccess,
+		},
+		Question: []dns.Question{question},
+	}
+	if len(response) > 0 {
+		for _, address := range response {
+			message.Answer = append(message.Answer, &dns.A{
+				Hdr: dns.RR_Header{
+					Name:   question.Name,
+					Rrtype: qType,
+					Class:  dns.ClassINET,
+					Ttl:    timeToLive,
+				},
+				A: address.AsSlice(),
+			})
+		}
+	}
+	c.storeCache(transport, question, message, int(timeToLive))
+}
+
+func (c *Client) updateLookupCache(transport Transport, domain string, options QueryOptions, disableCache bool, responseChecker func(responseAddrs []netip.Addr) bool) {
+	ctx := context.Background()
+	if c.logger != nil {
+		c.logger.DebugContext(ctx, "update domain ", domain, " lookup cache")
+	}
+	addresses, err := c.lookupFunc(ctx, transport, domain, options, disableCache, true, responseChecker)
+	if err != nil {
+		if errors.Is(err, ErrResponseRejectedCached) {
+			c.logger.DebugContext(ctx, "response rejected for ", domain, " (cached)")
+		} else if errors.Is(err, ErrResponseRejected) {
+			c.logger.DebugContext(ctx, "response rejected for ", domain)
+		} else {
+			c.logger.ErrorContext(ctx, E.Cause(err, "lookup failed for ", domain))
+		}
+	} else if len(addresses) == 0 {
+		c.logger.ErrorContext(ctx, "lookup failed for ", domain, ": empty result")
+	} else {
+		c.logger.InfoContext(ctx, "lookup succeed for ", domain, ": ", strings.Join(F.MapToString(addresses), " "))
+	}
 }
 
 func (c *Client) ClearCache() {
@@ -653,39 +739,40 @@ func (c *Client) ClearCache() {
 	}
 }
 
-func (c *Client) LookupCache(ctx context.Context, domain string, strategy DomainStrategy) ([]netip.Addr, bool) {
+func (c *Client) LookupCache(ctx context.Context, domain string, strategy DomainStrategy) ([]netip.Addr, bool, bool) {
 	if c.disableCache || c.independentCache {
-		return nil, false
+		return nil, false, false
 	}
 	if dns.IsFqdn(domain) {
 		domain = domain[:len(domain)-1]
 	}
 	dnsName := dns.Fqdn(domain)
 	if strategy == DomainStrategyUseIPv4 {
-		response, err := c.questionCache(dns.Question{
+		response, needUpdate, err := c.questionCache(dns.Question{
 			Name:   dnsName,
 			Qtype:  dns.TypeA,
 			Qclass: dns.ClassINET,
 		}, nil)
 		if err != ErrNotCached {
-			return response, true
+			return response, true, needUpdate
 		}
 	} else if strategy == DomainStrategyUseIPv6 {
-		response, err := c.questionCache(dns.Question{
+		response, needUpdate, err := c.questionCache(dns.Question{
 			Name:   dnsName,
 			Qtype:  dns.TypeAAAA,
 			Qclass: dns.ClassINET,
 		}, nil)
 		if err != ErrNotCached {
-			return response, true
+			return response, true, needUpdate
 		}
 	} else {
 		var wg sync.WaitGroup
 		var response4, response6 []netip.Addr
+		var needUpdate4, needUpdate6 bool
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			response4, _ = c.questionCache(dns.Question{
+			response4, needUpdate4, _ = c.questionCache(dns.Question{
 				Name:   dnsName,
 				Qtype:  dns.TypeA,
 				Qclass: dns.ClassINET,
@@ -693,7 +780,7 @@ func (c *Client) LookupCache(ctx context.Context, domain string, strategy Domain
 		}()
 		go func() {
 			defer wg.Done()
-			response6, _ = c.questionCache(dns.Question{
+			response6, needUpdate6, _ = c.questionCache(dns.Question{
 				Name:   dnsName,
 				Qtype:  dns.TypeAAAA,
 				Qclass: dns.ClassINET,
@@ -701,24 +788,24 @@ func (c *Client) LookupCache(ctx context.Context, domain string, strategy Domain
 		}()
 		wg.Wait()
 		if len(response4) > 0 || len(response6) > 0 {
-			return sortAddresses(response4, response6, strategy), true
+			return sortAddresses(response4, response6, strategy), true, needUpdate4 || needUpdate6
 		}
 	}
-	return nil, false
+	return nil, false, false
 }
 
-func (c *Client) ExchangeCache(ctx context.Context, message *dns.Msg) (*dns.Msg, bool) {
+func (c *Client) ExchangeCache(ctx context.Context, message *dns.Msg) (*dns.Msg, bool, bool) {
 	if c.disableCache || c.independentCache || len(message.Question) != 1 {
-		return nil, false
+		return nil, false, false
 	}
 	question := message.Question[0]
-	response, ttl := c.loadResponse(question, nil)
+	response, ttl, needUpdate := c.loadResponse(question, nil)
 	if response == nil {
-		return nil, false
+		return nil, false, false
 	}
 	logCachedResponse(c.logger, ctx, response, ttl)
 	response.Id = message.Id
-	return response, true
+	return response, true, needUpdate
 }
 
 func sortAddresses(response4 []netip.Addr, response6 []netip.Addr, strategy DomainStrategy) []netip.Addr {
@@ -754,14 +841,14 @@ func (c *Client) storeCache(transport Transport, question dns.Question, message 
 	}
 }
 
-func (c *Client) exchangeToLookup(ctx context.Context, transport Transport, message *dns.Msg, question dns.Question, options QueryOptions) (*dns.Msg, error) {
+func (c *Client) exchangeToLookup(ctx context.Context, transport Transport, message *dns.Msg, question dns.Question, options QueryOptions, isCacheUpdate bool) (*dns.Msg, error) {
 	domain := question.Name
 	if question.Qtype == dns.TypeA {
 		options.Strategy = DomainStrategyUseIPv4
 	} else {
 		options.Strategy = DomainStrategyUseIPv6
 	}
-	result, err := c.Lookup(ctx, transport, domain, options)
+	result, err := c.Lookup(ctx, transport, domain, options, isCacheUpdate)
 	if err != nil {
 		return nil, wrapError(err)
 	}
@@ -774,18 +861,11 @@ func (c *Client) exchangeToLookup(ctx context.Context, transport Transport, mess
 	return FixedResponse(message.Id, question, result, timeToLive), nil
 }
 
-func (c *Client) lookupToExchange(ctx context.Context, transport Transport, name string, qType uint16, options QueryOptions, responseChecker func(responseAddrs []netip.Addr) bool) ([]netip.Addr, error) {
+func (c *Client) lookupToExchange(ctx context.Context, transport Transport, name string, qType uint16, options QueryOptions, isCacheUpdate bool, responseChecker func(responseAddrs []netip.Addr) bool) ([]netip.Addr, error) {
 	question := dns.Question{
 		Name:   name,
 		Qtype:  qType,
 		Qclass: dns.ClassINET,
-	}
-	disableCache := c.disableCache || options.DisableCache
-	if !disableCache {
-		cachedAddresses, err := c.questionCache(question, transport)
-		if err != ErrNotCached {
-			return cachedAddresses, err
-		}
 	}
 	message := dns.Msg{
 		MsgHdr: dns.MsgHdr{
@@ -793,12 +873,26 @@ func (c *Client) lookupToExchange(ctx context.Context, transport Transport, name
 		},
 		Question: []dns.Question{question},
 	}
+	disableCache := c.disableCache || options.DisableCache
+	if !isCacheUpdate && !disableCache {
+		cachedAddresses, needUpdate, err := c.questionCache(question, transport)
+		if err != ErrNotCached {
+			if needUpdate {
+				go c.lookupToExchangeFunc(ctx, transport, &message, options, true, responseChecker)
+			}
+			return cachedAddresses, err
+		}
+	}
+	return c.lookupToExchangeFunc(ctx, transport, &message, options, isCacheUpdate, responseChecker)
+}
+
+func (c *Client) lookupToExchangeFunc(ctx context.Context, transport Transport, message *dns.Msg, options QueryOptions, isCacheUpdate bool, responseChecker func(responseAddrs []netip.Addr) bool) ([]netip.Addr, error) {
 	var (
 		response *dns.Msg
 		err      error
 	)
 	if responseChecker != nil {
-		response, err = c.ExchangeWithResponseCheck(ctx, transport, &message, options, func(response *dns.Msg) bool {
+		response, err = c.ExchangeWithResponseCheck(ctx, transport, message, options, isCacheUpdate, func(response *dns.Msg) bool {
 			addresses, addrErr := MessageToAddresses(response)
 			if addrErr != nil {
 				return false
@@ -806,7 +900,7 @@ func (c *Client) lookupToExchange(ctx context.Context, transport Transport, name
 			return responseChecker(addresses)
 		})
 	} else {
-		response, err = c.Exchange(ctx, transport, &message, options)
+		response, err = c.Exchange(ctx, transport, message, options, isCacheUpdate)
 	}
 	if err != nil {
 		return nil, err
@@ -814,15 +908,16 @@ func (c *Client) lookupToExchange(ctx context.Context, transport Transport, name
 	return MessageToAddresses(response)
 }
 
-func (c *Client) questionCache(question dns.Question, transport Transport) ([]netip.Addr, error) {
-	response, _ := c.loadResponse(question, transport)
+func (c *Client) questionCache(question dns.Question, transport Transport) ([]netip.Addr, bool, error) {
+	response, _, needUpdate := c.loadResponse(question, transport)
 	if response == nil {
-		return nil, ErrNotCached
+		return nil, false, ErrNotCached
 	}
-	return MessageToAddresses(response)
+	addresses, err := MessageToAddresses(response)
+	return addresses, needUpdate, err
 }
 
-func (c *Client) loadResponse(question dns.Question, transport Transport) (*dns.Msg, int) {
+func (c *Client) loadResponse(question dns.Question, transport Transport) (*dns.Msg, int, bool) {
 	var (
 		response *dns.Msg
 		loaded   bool
@@ -837,9 +932,9 @@ func (c *Client) loadResponse(question dns.Question, transport Transport) (*dns.
 			})
 		}
 		if !loaded {
-			return nil, 0
+			return nil, 0, false
 		}
-		return response.Copy(), 0
+		return response.Copy(), 0, false
 	} else {
 		var expireAt time.Time
 		if !c.independentCache {
@@ -851,10 +946,20 @@ func (c *Client) loadResponse(question dns.Question, transport Transport) (*dns.
 			})
 		}
 		if !loaded {
-			return nil, 0
+			return nil, 0, false
 		}
 		timeNow := time.Now()
+		isUpdating := c.getUpdatingStatus(question, transport)
 		if timeNow.After(expireAt) {
+			if c.lazyCache {
+				lazyResponse := response.Copy()
+				for _, recordList := range [][]dns.RR{lazyResponse.Answer, lazyResponse.Ns, lazyResponse.Extra} {
+					for _, record := range recordList {
+						record.Header().Ttl = 1
+					}
+				}
+				return lazyResponse, 0, !isUpdating
+			}
 			if !c.independentCache {
 				c.cache.Remove(question)
 			} else {
@@ -863,7 +968,7 @@ func (c *Client) loadResponse(question dns.Question, transport Transport) (*dns.
 					transportName: transport.Name(),
 				})
 			}
-			return nil, 0
+			return nil, 0, false
 		}
 		var originTTL int
 		for _, recordList := range [][]dns.RR{response.Answer, response.Ns, response.Extra} {
@@ -892,7 +997,42 @@ func (c *Client) loadResponse(question dns.Question, transport Transport) (*dns.
 				}
 			}
 		}
-		return response, nowTTL
+		return response, nowTTL, !isUpdating && expireAt.Sub(timeNow) < 2*time.Second
+	}
+}
+
+func (c *Client) getUpdatingStatus(question dns.Question, transport Transport) bool {
+	var isUpdating bool
+	if !c.independentCache {
+		_, isUpdating = c.cacheUpdating.Get(question)
+	} else {
+		_, isUpdating = c.transportCacheUpdating.Get(transportCacheKey{
+			Question:      question,
+			transportName: transport.Name(),
+		})
+	}
+	return isUpdating
+}
+
+func (c *Client) storeUpdatingStatus(question dns.Question, transport Transport) {
+	if !c.independentCache {
+		c.cacheUpdating.Add(question, struct{}{})
+	} else {
+		c.transportCacheUpdating.Add(transportCacheKey{
+			Question:      question,
+			transportName: transport.Name(),
+		}, struct{}{})
+	}
+}
+
+func (c *Client) removeUpdatingStatus(question dns.Question, transport Transport) {
+	if !c.independentCache {
+		c.cacheUpdating.Remove(question)
+	} else {
+		c.transportCacheUpdating.Remove(transportCacheKey{
+			Question:      question,
+			transportName: transport.Name(),
+		})
 	}
 }
 

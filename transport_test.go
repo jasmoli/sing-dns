@@ -39,7 +39,7 @@ func TestTransports(t *testing.T) {
 			})
 			addresses, err := client.Lookup(context.Background(), transport, "cloudflare.com", dns.QueryOptions{
 				Strategy: dns.DomainStrategyUseIPv4,
-			})
+			}, false)
 			require.NoError(t, err)
 			require.NotEmpty(t, addresses)
 		})
