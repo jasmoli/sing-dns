@@ -504,19 +504,55 @@ func (c *Client) LookupWithResponseCheck(ctx context.Context, transport Transpor
 		} else if options.Strategy == DomainStrategyUseIPv6 {
 			return c.lookupToExchange(ctx, transport, dnsName, dns.TypeAAAA, options, isCacheUpdate, responseChecker)
 		}
-		var wg sync.WaitGroup
 		var response4, response6 []netip.Addr
 		var v4Err, v6Err error
-		wg.Add(2)
+		dual := newDualRequest()
 		go func() {
-			defer wg.Done()
+			defer dual.doneV4()
 			response4, v4Err = c.lookupToExchange(ctx, transport, dnsName, dns.TypeA, options, isCacheUpdate, responseChecker)
 		}()
 		go func() {
-			defer wg.Done()
+			defer dual.doneV6()
 			response6, v6Err = c.lookupToExchange(ctx, transport, dnsName, dns.TypeAAAA, options, isCacheUpdate, responseChecker)
 		}()
-		wg.Wait()
+		question4 := dns.Question{
+			Name:   dnsName,
+			Qtype:  dns.TypeA,
+			Qclass: dns.ClassINET,
+		}
+		question6 := dns.Question{
+			Name:   dnsName,
+			Qtype:  dns.TypeA,
+			Qclass: dns.ClassINET,
+		}
+		if isCacheUpdate || (c.getCacheStatus(question4, transport) && c.getCacheStatus(question6, transport)) {
+			dual.waitAll()
+		} else if options.Strategy == DomainStrategyPreferIPv4 {
+			<-dual.v4
+			if len(response4) > 0 {
+				return response4, nil
+			}
+			<-dual.v6
+		} else if options.Strategy == DomainStrategyPreferIPv6 {
+			<-dual.v6
+			if len(response6) > 0 {
+				return response6, nil
+			}
+			<-dual.v4
+		} else {
+			select {
+			case <-dual.v4:
+				if len(response4) > 0 {
+					return response4, nil
+				}
+				<-dual.v6
+			case <-dual.v6:
+				if len(response6) > 0 {
+					return response6, nil
+				}
+				<-dual.v4
+			}
+		}
 		if len(response4) == 0 && len(response6) == 0 {
 			return nil, errors.Join(v4Err, v6Err)
 		}
@@ -1001,6 +1037,19 @@ func (c *Client) loadResponse(question dns.Question, transport Transport) (*dns.
 	}
 }
 
+func (c *Client) getCacheStatus(question dns.Question, transport Transport) bool {
+	var loaded bool
+	if !c.independentCache {
+		_, loaded = c.cache.Get(question)
+	} else {
+		_, loaded = c.transportCache.Get(transportCacheKey{
+			Question:      question,
+			transportName: transport.Name(),
+		})
+	}
+	return loaded
+}
+
 func (c *Client) getUpdatingStatus(question dns.Question, transport Transport) bool {
 	var isUpdating bool
 	if !c.independentCache {
@@ -1079,4 +1128,38 @@ func contextWithTransportName(ctx context.Context, transportName string) context
 func transportNameFromContext(ctx context.Context) (string, bool) {
 	value, loaded := ctx.Value(transportKey{}).(string)
 	return value, loaded
+}
+
+type dualRequest struct {
+	v4 chan struct{}
+	v6 chan struct{}
+}
+
+func newDualRequest() dualRequest {
+	return dualRequest{
+		v4: make(chan struct{}),
+		v6: make(chan struct{}),
+	}
+}
+
+func (r *dualRequest) doneV4() {
+	r.v4 <- struct{}{}
+}
+
+func (r *dualRequest) doneV6() {
+	r.v6 <- struct{}{}
+}
+
+func (r *dualRequest) waitAll() {
+	select {
+	case <-r.v4:
+		<-r.v6
+	case <-r.v6:
+		<-r.v4
+	}
+}
+
+func (r *dualRequest) close() {
+	close(r.v4)
+	close(r.v6)
 }
