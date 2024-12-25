@@ -6,7 +6,6 @@ import (
 	"net/netip"
 	"time"
 
-	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
@@ -32,7 +31,7 @@ func (d *DefaultDialer) DialContext(ctx context.Context, network string, destina
 		}
 		return N.DialParallel(ctx, d.dialer, network, destination, addresses, d.client.strategy == DomainStrategyPreferIPv6, d.fallbackDelay)
 	}
-	return nil, E.New("Invalid address")
+	return d.dialer.DialContext(ctx, network, destination)
 }
 
 func (d *DefaultDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
@@ -44,7 +43,7 @@ func (d *DefaultDialer) ListenPacket(ctx context.Context, destination M.Socksadd
 		conn, _, err := N.ListenSerial(ctx, d.dialer, destination, addresses)
 		return conn, err
 	}
-	return nil, E.New("Invalid address")
+	return d.dialer.ListenPacket(ctx, destination)
 }
 
 type DialerWrapper struct {
