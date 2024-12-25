@@ -3,6 +3,7 @@ package dns
 import (
 	"context"
 	"net"
+	"net/netip"
 	"time"
 
 	E "github.com/sagernet/sing/common/exceptions"
@@ -26,6 +27,9 @@ func (d *DefaultDialer) DialContext(ctx context.Context, network string, destina
 	}
 	destination.Fqdn = d.client.GetExactDomainFromHosts(ctx, destination.Fqdn, false)
 	if addresses := d.client.GetAddrsFromHosts(ctx, destination.Fqdn, d.client.strategy, false); len(addresses) > 0 {
+		if d.client.strategy == DomainStrategyAsIS {
+			return N.DialSerial(ctx, d.dialer, network, destination, addresses)
+		}
 		return N.DialParallel(ctx, d.dialer, network, destination, addresses, d.client.strategy == DomainStrategyPreferIPv6, d.fallbackDelay)
 	}
 	return nil, E.New("Invalid address")
@@ -63,14 +67,18 @@ func (d *DialerWrapper) DialContext(ctx context.Context, network string, destina
 	if d.strategy != DomainStrategyAsIS {
 		strategy = d.strategy
 	}
-	if addresses := d.client.GetAddrsFromHosts(ctx, destination.Fqdn, strategy, false); len(addresses) > 0 {
-		return N.DialParallel(ctx, d.dialer, network, destination, addresses, strategy == DomainStrategyPreferIPv6, d.fallbackDelay)
+	var addresses []netip.Addr
+	if addresses = d.client.GetAddrsFromHosts(ctx, destination.Fqdn, strategy, false); len(addresses) == 0 {
+		var err error
+		addresses, err = d.client.Lookup(ctx, d.transport, destination.Fqdn, QueryOptions{
+			Strategy: strategy,
+		}, false)
+		if err != nil {
+			return nil, err
+		}
 	}
-	addresses, err := d.client.Lookup(ctx, d.transport, destination.Fqdn, QueryOptions{
-		Strategy: strategy,
-	}, false)
-	if err != nil {
-		return nil, err
+	if strategy == DomainStrategyAsIS {
+		return N.DialSerial(ctx, d.dialer, network, destination, addresses)
 	}
 	return N.DialParallel(ctx, d.dialer, network, destination, addresses, strategy == DomainStrategyPreferIPv6, d.fallbackDelay)
 }
@@ -84,15 +92,15 @@ func (d *DialerWrapper) ListenPacket(ctx context.Context, destination M.Socksadd
 	if d.strategy != DomainStrategyAsIS {
 		strategy = d.strategy
 	}
-	if addresses := d.client.GetAddrsFromHosts(ctx, destination.Fqdn, strategy, false); len(addresses) > 0 {
-		conn, _, err := N.ListenSerial(ctx, d.dialer, destination, addresses)
-		return conn, err
-	}
-	addresses, err := d.client.Lookup(ctx, d.transport, destination.Fqdn, QueryOptions{
-		Strategy: strategy,
-	}, false)
-	if err != nil {
-		return nil, err
+	var addresses []netip.Addr
+	if addresses = d.client.GetAddrsFromHosts(ctx, destination.Fqdn, strategy, false); len(addresses) == 0 {
+		var err error
+		addresses, err = d.client.Lookup(ctx, d.transport, destination.Fqdn, QueryOptions{
+			Strategy: strategy,
+		}, false)
+		if err != nil {
+			return nil, err
+		}
 	}
 	conn, _, err := N.ListenSerial(ctx, d.dialer, destination, addresses)
 	return conn, err
