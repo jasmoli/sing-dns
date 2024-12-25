@@ -85,6 +85,7 @@ type Client struct {
 	disableExpire          bool
 	independentCache       bool
 	lazyCache              bool
+	strategy               DomainStrategy
 	hosts                  *Hosts
 	rdrc                   RDRCStore
 	initRDRCFunc           func() RDRCStore
@@ -113,6 +114,7 @@ type ClientOptions struct {
 	IndependentCache bool
 	CacheCapacity    uint32
 	LazyCache        bool
+	Strategy         DomainStrategy
 	Hosts            *Hosts
 	RDRC             func() RDRCStore
 	Logger           logger.ContextLogger
@@ -125,6 +127,7 @@ func NewClient(options ClientOptions) *Client {
 		disableExpire:    options.DisableExpire,
 		independentCache: options.IndependentCache,
 		lazyCache:        options.LazyCache,
+		strategy:         options.Strategy,
 		hosts:            options.Hosts,
 		initRDRCFunc:     options.RDRC,
 		logger:           options.Logger,
